@@ -60,6 +60,9 @@ function blockResponse(output) {
   return { statusCode, contentType, headers, body: JSON.parse(Buffer.from(body, 'base64').toString('utf8')) };
 }
 
+const BLOCK_STATUS = { bedrock_invoke: 451, anthropic_messages: 403, openai_chat: 403 };
+const formatOf = (body) => ('message' in body ? 'bedrock_invoke' : body.type === 'error' ? 'anthropic_messages' : 'openai_chat');
+
 describe('inference route table', () => {
   const evaluated = [
     {
@@ -140,7 +143,7 @@ describe('inference route table', () => {
       const { handler, calls, logged } = setup();
       const response = blockResponse(await handler(httpEvent({ path, body: CHAT_BODY })));
       assert.equal(calls.length, 0);
-      assert.equal(response.statusCode, 403);
+      assert.equal(response.statusCode, BLOCK_STATUS[format]);
       assert.deepEqual(response.body, ERROR_BODY[format](UNSUPPORTED));
       assert.equal(logged().outcome, 'unsupported');
     });
@@ -167,7 +170,7 @@ describe('inference route table', () => {
     it('POST /model/{model}/invoke is blocked when the policy denies it', async () => {
       const { handler } = setup({ respond: deny });
       const response = blockResponse(await handler(unprefixed(evaluated[0].event)));
-      assert.equal(response.statusCode, 403);
+      assert.equal(response.statusCode, BLOCK_STATUS.bedrock_invoke);
       assert.deepEqual(response.body, { message: 'Blocked by LangGuard: Prompt has PII.' });
     });
 
@@ -203,7 +206,7 @@ describe('LANGGUARD_GATEWAY_KIND=inference', () => {
       const { handler, calls, logged } = setup({ env: INFERENCE_ENV });
       const response = blockResponse(await handler(httpEvent({ path, body: CHAT_BODY })));
       assert.equal(calls.length, 0);
-      assert.equal(response.statusCode, 403);
+      assert.equal(response.statusCode, BLOCK_STATUS[formatOf(body)]);
       assert.deepEqual(response.body, body);
       assert.equal(logged().outcome, 'unsupported');
     });
@@ -241,7 +244,7 @@ describe('LANGGUARD_GATEWAY_KIND=inference', () => {
         httpEvent({ path: '/v1/orders', body: CHAT_BODY }),
       ]) {
         const response = blockResponse(await handler(event));
-        assert.equal(response.statusCode, 403);
+        assert.equal(response.statusCode, BLOCK_STATUS[formatOf(response.body)]);
         assert.equal(
           response.body.message ?? response.body.error.message,
           'Blocked by LangGuard: the policy check is unavailable, so this model call is not allowed.',
@@ -305,7 +308,7 @@ describe('block format of each dialect', () => {
       dialect: 'bedrock_invoke',
       event: httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: BEDROCK_BODY }),
       expected: {
-        statusCode: 403,
+        statusCode: 451,
         contentType: 'application/json',
         headers: { 'x-amzn-ErrorType': 'AccessDeniedException' },
         body: { message: policyText },
@@ -359,7 +362,7 @@ describe('model requests that cannot be read', () => {
       const { handler, calls, logged } = setup();
       const response = blockResponse(await handler(event));
       assert.equal(calls.length, 0);
-      assert.equal(response.statusCode, 403);
+      assert.equal(response.statusCode, BLOCK_STATUS[formatOf(response.body)]);
       assert.equal(
         response.body.message ?? response.body.error.message,
         'Blocked by LangGuard: this is not a valid model request, so it was not sent for a policy check.',
@@ -384,7 +387,7 @@ describe('duplicate keys in the body', () => {
       const { handler, calls, logged } = setup();
       const response = blockResponse(await handler(httpEvent({ path, body: b64(text) })));
       assert.equal(calls.length, 0);
-      assert.equal(response.statusCode, 403);
+      assert.equal(response.statusCode, BLOCK_STATUS[formatOf(response.body)]);
       assert.equal(response.body.message ?? response.body.error.message, NOT_VALID);
       assert.equal(logged().reason, 'body has a duplicate top-level key');
     });
@@ -424,7 +427,7 @@ describe('error texts', () => {
   it('a JSON-RPC -32602 from LangGuard is blocked with the "not valid" text', async () => {
     const { handler, logged } = setup({ respond: () => json({ jsonrpc: '2.0', id: 'x', error: { code: -32602, message: 'Invalid params' } }) });
     const response = blockResponse(await handler(httpEvent({ path: invoke, body: BEDROCK_BODY })));
-    assert.equal(response.statusCode, 403);
+    assert.equal(response.statusCode, BLOCK_STATUS.bedrock_invoke);
     assert.deepEqual(response.body, { message: NOT_VALID });
     assert.equal(logged().reason, 'JSON-RPC error -32602');
   });
@@ -443,7 +446,7 @@ describe('LangGuard unavailable', () => {
     it(`${name} blocks the model call with the "unavailable" text`, async () => {
       const { handler } = setup(options);
       const response = blockResponse(await handler(event));
-      assert.equal(response.statusCode, 403);
+      assert.equal(response.statusCode, BLOCK_STATUS.bedrock_invoke);
       assert.deepEqual(response.body, { message: UNAVAILABLE });
     });
   }
@@ -527,7 +530,7 @@ describe('size and binary content', () => {
   it('follows a LangGuard 413 with the "too large" block', async () => {
     const { handler } = setup({ respond: () => json({}, 413) });
     const response = blockResponse(await handler(httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: BEDROCK_BODY })));
-    assert.equal(response.statusCode, 403);
+    assert.equal(response.statusCode, BLOCK_STATUS.bedrock_invoke);
     assert.deepEqual(response.body, {
       message: 'Blocked by LangGuard: the model request is too large for the policy check, so it is not allowed.',
     });

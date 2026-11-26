@@ -41,9 +41,9 @@ const ROUTES = [
 ];
 
 const ERROR_FORMATS = {
-  bedrock_invoke: { headers: { 'x-amzn-ErrorType': 'AccessDeniedException' }, body: (message) => ({ message }) },
-  anthropic_messages: { body: (message) => ({ type: 'error', error: { type: 'permission_error', message } }) },
-  openai_chat: { body: (message) => ({ error: { message, type: 'permission_denied' } }) },
+  bedrock_invoke: { statusCode: 451, headers: { 'x-amzn-ErrorType': 'AccessDeniedException' }, body: (message) => ({ message }) },
+  anthropic_messages: { statusCode: 403, body: (message) => ({ type: 'error', error: { type: 'permission_error', message } }) },
+  openai_chat: { statusCode: 403, body: (message) => ({ error: { message, type: 'permission_denied' } }) },
 };
 
 export const MODEL_BLOCK_TEXT = {
@@ -245,12 +245,12 @@ export function invokeModelParams({ dialect, model, stream, body }, { config, co
  * @param {string} text
  */
 export function httpBlock(format, text) {
-  const { headers, body } = ERROR_FORMATS[format];
+  const { statusCode, headers, body } = ERROR_FORMATS[format];
   return {
     interceptorOutputVersion: '1.0',
     http: {
       transformedGatewayResponse: {
-        statusCode: 403,
+        statusCode,
         contentType: 'application/json',
         ...(headers ? { headers } : {}),
         body: Buffer.from(JSON.stringify(body(text))).toString('base64'),

@@ -291,13 +291,15 @@ Set `LANGGUARD_GATEWAY_KIND` to `inference` on a function that serves only infer
 
 ### Blocks
 
-A block is a response from the gateway with HTTP status 403, in the error format of the client. The gateway then does not call Amazon Bedrock.
+A block is a response from the gateway in the error format of the client. The gateway then does not call Amazon Bedrock.
 
-| Dialect | Headers | Body |
-| --- | --- | --- |
-| `bedrock_invoke` | `x-amzn-ErrorType: AccessDeniedException` | `{"message": "<text>"}` |
-| `anthropic_messages` | None | `{"type": "error", "error": {"type": "permission_error", "message": "<text>"}}` |
-| `openai_chat` | None | `{"error": {"message": "<text>", "type": "permission_denied"}}` |
+| Dialect | Status | Headers | Body |
+| --- | --- | --- | --- |
+| `bedrock_invoke` | 451 | `x-amzn-ErrorType: AccessDeniedException` | `{"message": "<text>"}` |
+| `anthropic_messages` | 403 | None | `{"type": "error", "error": {"type": "permission_error", "message": "<text>"}}` |
+| `openai_chat` | 403 | None | `{"error": {"message": "<text>", "type": "permission_denied"}}` |
+
+The `bedrock_invoke` status is 451, not 403, because Claude Code sends a call again when the answer of an Amazon Bedrock call is HTTP 403. In a test with Claude Code 2.1.331 and a local stand-in for the gateway, Claude Code sent a call that was blocked with HTTP 403 13 times in 243 seconds, and then showed an AWS authentication error before the LangGuard text. With HTTP 451 it sent the call 1 time and showed only the LangGuard text. The `x-amzn-ErrorType` header stays `AccessDeniedException`, so the AWS SDK and the AWS CLI report the same error name.
 
 A blocked call to a path that is not supported uses the Amazon Bedrock format under `/model/`, the Anthropic format under `/v1/messages/`, and the OpenAI format for other paths.
 
@@ -328,6 +330,7 @@ For a model call, the log line also has `route` (the row name: `invoke`, `invoke
 - That Amazon Bedrock rejects a body with a top-level key two times, or which value it uses. The function blocks such a body.
 - What the gateway does with a model call that is larger than the event size limit of Lambda. The function does not measure the body. LangGuard answers HTTP 413 for a body larger than its limit, and the function then blocks the call.
 - That the client gets the `x-amzn-ErrorType` header of a block. The AWS SDK uses that header to make an `AccessDeniedException`.
+- That the gateway gives the HTTP status 451 of a `bedrock_invoke` block to the client unchanged. The AWS documentation states no limit on the status code of an interceptor response, and its examples use only 200.
 - That the gateway gives the `Authorization` header of a SigV4 call to the interceptor. This is also not verified for tool calls (see "Find the user of an AWS_IAM call").
 
 ## Run the tests
