@@ -299,7 +299,9 @@ A block is a response from the gateway in the error format of the client. The ga
 | `anthropic_messages` | 403 | None | `{"type": "error", "error": {"type": "permission_error", "message": "<text>"}}` |
 | `openai_chat` | 403 | None | `{"error": {"message": "<text>", "type": "permission_denied"}}` |
 
-The `bedrock_invoke` status is 451, not 403, because Claude Code sends a call again when the answer of an Amazon Bedrock call is HTTP 403. In a test with Claude Code 2.1.331 and a local stand-in for the gateway, Claude Code sent a call that was blocked with HTTP 403 13 times in 243 seconds, and then showed an AWS authentication error before the LangGuard text. With HTTP 451 it sent the call 1 time and showed only the LangGuard text. The `x-amzn-ErrorType` header stays `AccessDeniedException`, so the AWS SDK and the AWS CLI report the same error name.
+The `bedrock_invoke` status is 451, not 403, because of Claude Code. In a test with a local stand-in for the gateway, Claude Code 2.1.331 sent a call that was blocked with HTTP 403 13 times in 243 seconds, and then showed an AWS authentication error before the LangGuard text. With HTTP 451 it sent the call 1 time and showed only the LangGuard text. The `x-amzn-ErrorType` header stays `AccessDeniedException`, and the AWS CLI reports that error name with the two statuses.
+
+The function uses the `bedrock_invoke` format when no dialect applies: for a request whose path it cannot read, and for each request while `LANGGUARD_GATEWAY_KIND` has a value that is not `inference`.
 
 A blocked call to a path that is not supported uses the Amazon Bedrock format under `/model/`, the Anthropic format under `/v1/messages/`, and the OpenAI format for other paths.
 

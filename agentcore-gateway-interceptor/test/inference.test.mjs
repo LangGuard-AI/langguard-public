@@ -238,13 +238,14 @@ describe('LANGGUARD_GATEWAY_KIND=inference', () => {
   for (const value of ['Inference', 'mcp', ' inference']) {
     it(`blocks each REQUEST event with the "unavailable" text when the value is ${JSON.stringify(value)}`, async () => {
       const { handler, calls, logged } = setup({ env: { ...ENV, LANGGUARD_GATEWAY_KIND: value } });
-      for (const event of [
-        httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: BEDROCK_BODY }),
-        httpEvent({ method: 'GET', path: '/inference/v1/models' }),
-        httpEvent({ path: '/v1/orders', body: CHAT_BODY }),
+      for (const [format, event] of [
+        ['bedrock_invoke', httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: BEDROCK_BODY })],
+        ['bedrock_invoke', httpEvent({ method: 'GET', path: '/inference/v1/models' })],
+        ['openai_chat', httpEvent({ path: '/v1/orders', body: CHAT_BODY })],
       ]) {
         const response = blockResponse(await handler(event));
-        assert.equal(response.statusCode, BLOCK_STATUS[formatOf(response.body)]);
+        assert.equal(formatOf(response.body), format);
+        assert.equal(response.statusCode, BLOCK_STATUS[format]);
         assert.equal(
           response.body.message ?? response.body.error.message,
           'Blocked by LangGuard: the policy check is unavailable, so this model call is not allowed.',
@@ -352,17 +353,18 @@ describe('block format of each dialect', () => {
 });
 
 describe('model requests that cannot be read', () => {
-  for (const [name, event] of [
-    ['a body that is not JSON', httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: b64('not json') })],
-    ['a JSON array body', httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: [BEDROCK_BODY] })],
-    ['no body', httpEvent({ path: `/inference/model/${encodedModel}/invoke` })],
-    ['a messages body without a model', httpEvent({ path: '/inference/v1/messages', body: BEDROCK_BODY })],
+  for (const [name, event, format] of [
+    ['a body that is not JSON', httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: b64('not json') }), 'bedrock_invoke'],
+    ['a JSON array body', httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: [BEDROCK_BODY] }), 'bedrock_invoke'],
+    ['no body', httpEvent({ path: `/inference/model/${encodedModel}/invoke` }), 'bedrock_invoke'],
+    ['a messages body without a model', httpEvent({ path: '/inference/v1/messages', body: BEDROCK_BODY }), 'anthropic_messages'],
   ]) {
     it(`${name} is blocked with the "not valid" text and no LangGuard call`, async () => {
       const { handler, calls, logged } = setup();
       const response = blockResponse(await handler(event));
       assert.equal(calls.length, 0);
-      assert.equal(response.statusCode, BLOCK_STATUS[formatOf(response.body)]);
+      assert.equal(formatOf(response.body), format);
+      assert.equal(response.statusCode, BLOCK_STATUS[format]);
       assert.equal(
         response.body.message ?? response.body.error.message,
         'Blocked by LangGuard: this is not a valid model request, so it was not sent for a policy check.',
@@ -378,16 +380,17 @@ describe('duplicate keys in the body', () => {
   const HIDDEN = JSON.stringify(BEDROCK_BODY.messages);
   const invoke = `/inference/model/${encodedModel}/invoke`;
 
-  for (const [name, path, text] of [
-    ['a repeated messages key', invoke, `{"anthropic_version":"bedrock-2023-05-31","max_tokens":10,"messages":${HIDDEN},"messages":${SAFE}}`],
-    ['a repeated key with an escape', invoke, `{"anthropic_version":"bedrock-2023-05-31","messages":${HIDDEN},"\\u006dessages":${SAFE}}`],
-    ['a repeated model key', '/inference/v1/messages', `{"model":"claude-sonnet-4-5","max_tokens":10,"model":"other","messages":${HIDDEN}}`],
+  for (const [name, path, format, text] of [
+    ['a repeated messages key', invoke, 'bedrock_invoke', `{"anthropic_version":"bedrock-2023-05-31","max_tokens":10,"messages":${HIDDEN},"messages":${SAFE}}`],
+    ['a repeated key with an escape', invoke, 'bedrock_invoke', `{"anthropic_version":"bedrock-2023-05-31","messages":${HIDDEN},"\\u006dessages":${SAFE}}`],
+    ['a repeated model key', '/inference/v1/messages', 'anthropic_messages', `{"model":"claude-sonnet-4-5","max_tokens":10,"model":"other","messages":${HIDDEN}}`],
   ]) {
     it(`${name} is blocked with the "not valid" text and no LangGuard call`, async () => {
       const { handler, calls, logged } = setup();
       const response = blockResponse(await handler(httpEvent({ path, body: b64(text) })));
       assert.equal(calls.length, 0);
-      assert.equal(response.statusCode, BLOCK_STATUS[formatOf(response.body)]);
+      assert.equal(formatOf(response.body), format);
+      assert.equal(response.statusCode, BLOCK_STATUS[format]);
       assert.equal(response.body.message ?? response.body.error.message, NOT_VALID);
       assert.equal(logged().reason, 'body has a duplicate top-level key');
     });
