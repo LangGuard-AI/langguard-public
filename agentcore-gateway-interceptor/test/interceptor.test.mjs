@@ -389,6 +389,11 @@ describe('fail closed', () => {
     });
   }
 
+  it('blocks a tools/call with the "not valid" text when LangGuard answers JSON-RPC -32602', async () => {
+    const { handler } = setup({ respond: () => json({ jsonrpc: '2.0', id: 'x', error: { code: -32602, message: 'Invalid params' } }) });
+    assert.equal(blockedText(await handler(requestEvent())), TEXT.invalid);
+  });
+
   it('logs a JSON-RPC error as the reason it blocked', async () => {
     const { handler, lines } = setup({
       respond: () => json({ jsonrpc: '2.0', id: 'x', error: { code: -32603, message: 'Internal server error' } }),

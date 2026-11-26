@@ -1,6 +1,6 @@
-# Apply LangGuard policy to AgentCore Gateway tool calls
+# Apply LangGuard policy to AgentCore Gateway tool calls and model calls
 
-This AWS Lambda function is a gateway interceptor for Amazon Bedrock AgentCore Gateway. It sends each MCP `tools/call` to LangGuard for a policy decision and applies the verdict.
+This AWS Lambda function is a gateway interceptor for Amazon Bedrock AgentCore Gateway. It sends each MCP `tools/call` to LangGuard for a policy decision and applies the verdict. On a gateway with an inference target, it also sends each model call to LangGuard before the gateway calls the model (see "Check model calls on an inference gateway").
 
 ```text
 agent -> gateway -> REQUEST interceptor -> LangGuard -> target -> RESPONSE interceptor -> LangGuard -> agent
@@ -85,6 +85,7 @@ A LangGuard result passes when `valid` is `true`, or when `valid` is `false` wit
 | Shadow mode, or a notify-only policy | Not blocked by a policy result. LangGuard records the decision only. Two cases block in every mode: LangGuard cannot be reached, or LangGuard has quarantined the agent. When LangGuard cannot read the enforcement mode, it blocks each call that Enforce mode would block. For the other calls it uses the older blocking rule of Shadow mode: a violation with block status, an unreachable policy engine, an evaluation error of an enforce policy, an escalation, and a remembered deny block. |
 | LangGuard not reachable, timeout, HTTP error, or bad response | Blocked with the "unavailable" text. There is no setting that allows calls when LangGuard is down. |
 | LangGuard answers HTTP 413 because the tool call or the tool result is larger than 1 MB | Blocked with the "too large" text. |
+| LangGuard answers JSON-RPC error `-32602` (invalid params) | Blocked with the "not valid" text. |
 | `LANGGUARD_URL` is not set or is not `https://` | Blocked with the "unavailable" text. The function does not call LangGuard. |
 | Secret cannot be read, or the read takes more than 3000 ms | Blocked with the "unavailable" text. |
 | `tools/call` has no tool name, the tool name is not a string, or the event is not valid | Blocked with the "not valid" text. The function does not call LangGuard. |
@@ -109,7 +110,7 @@ The function does not evaluate these events. It returns them unchanged:
 
 - MCP methods other than `tools/call`.
 - A response that has no `result`: a JSON-RPC error from the target, or a request from the server such as `elicitation/create` on a streaming response.
-- Events for HTTP targets (an `http` payload). The function returns an empty `http` object. AWS documents that as pass-through for the RESPONSE interceptor. For the REQUEST interceptor, this is not verified.
+- Events for HTTP targets (an `http` payload) with a path that is not under `/inference` and that no model call row agrees with (see "Routes"), and each `http` RESPONSE event. The function returns an empty `http` object. AWS documents that as pass-through for the RESPONSE interceptor ([interceptor types](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html)) and, in its model routing example, for the REQUEST interceptor of an inference target ([interceptor examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-examples.html)).
 
 The gateway also sends the block that the REQUEST interceptor made to the RESPONSE interceptor. The function recognises its own block by an HMAC signature over the response ID and the block text, made with the API key. It then returns only the block text, without a LangGuard call.
 
@@ -139,6 +140,7 @@ The function decodes the bearer token but does not verify its signature. The gat
 | `LANGGUARD_USER_CLAIM` | No | None | Name of the JWT claim to send as the user ID, for example `email`. It has an effect only with `CUSTOM_JWT`. |
 | `LANGGUARD_KEY_MAP_TABLE` | No | None | Name of the STS key map table. When it is not set, the function does not look up SigV4 callers. |
 | `LANGGUARD_KEY_MAP_TIMEOUT_MS` | No | `400` | Time limit for one key map lookup, in milliseconds, from 1 to 5000. Another value uses the default. |
+| `LANGGUARD_GATEWAY_KIND` | No | None | Set to `inference` when the function serves only gateways with an inference target (see "Inference gateway mode"). Another value that is not empty blocks each `http` REQUEST event with the "unavailable" text, and the function does not call LangGuard. |
 
 The Terraform variables `langguard_url`, `langguard_api_key_secret_arn`, `timeout_ms` (a whole number up to 20000), `gateway_authorizer_type` (default `CUSTOM_JWT`), and `user_claim` set these values. `user_claim` needs `gateway_authorizer_type = "CUSTOM_JWT"`. `secret_kms_key_arn` gives the function `kms:Decrypt` on the key that encrypts the secret, only through Secrets Manager.
 
@@ -221,6 +223,112 @@ A call can get no user: the first call after a sign-in, a lookup at its time lim
 - The event does not name its phase. A real gateway sends the `gatewayResponse` key in a REQUEST event too, with the value `null`. So the function reads an event as a REQUEST when `gatewayResponse` is missing or `null`, and as a RESPONSE for each other value. A value that is not an object ends as the `unsupported` block, and the reason names its type, for example `gatewayResponse is not an object (string)`.
 - After a key rotation, a warm function uses the old key until LangGuard rejects it. A test with a wrong key in the secret showed this: the function used the cached key for the 5-minute cache time, then blocked each call (HTTP 401 from LangGuard). After the correct key was back in the secret, the next call passed the key check.
 - The AgentCore documentation does not say what the gateway does when the Lambda fails or times out. It says that the gateway can retry the Lambda. The function does not throw. It returns a block for every error it can catch.
+
+## Check model calls on an inference gateway
+
+An AgentCore Gateway with an inference target serves model APIs under `/inference`. Claude Code can send its Amazon Bedrock calls to that path. The interceptor then gets each model call before the gateway calls Amazon Bedrock. You do not install anything on the developer machines.
+
+```text
+Claude Code -> gateway /inference -> REQUEST interceptor -> LangGuard -> Amazon Bedrock -> Claude Code
+```
+
+### Deploy the inference gateway
+
+The `examples/inference-gateway` directory has a Terraform template. It needs AWS provider 6.73 or later. It creates:
+
+- The interceptor function, from the `terraform` module of this package.
+- A gateway with no protocol type and the `AWS_IAM` authorizer. Set `authorizer_type = "CUSTOM_JWT"` and `jwt_discovery_url` for a JWT authorizer.
+- A target with the `bedrock-runtime` inference connector. The gateway calls Amazon Bedrock with its own role (`GATEWAY_IAM_ROLE`). Amazon Bedrock sees each call as the gateway role, not as the developer.
+- The interceptor on REQUEST only, with `pass_request_headers = true`. Do not add the function as a RESPONSE interceptor on this gateway. In the default `BUFFERED` mode, a RESPONSE interceptor holds a streamed answer until the model ends.
+- The gateway role, or a policy on the role that `existing_gateway_role_name` names. The policy has `lambda:InvokeFunction` on the interceptor, `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on foundation models, inference profiles, application inference profiles, provisioned models, custom model deployments and imported models (set `invoke_model_resource_arns` to give fewer models), `bedrock:GetFoundationModel`, `bedrock:GetInferenceProfile`, and the list actions that the target uses to find the models: `ListFoundationModels`, `ListInferenceProfiles`, `ListProvisionedModelThroughputs`, `ListCustomModelDeployments`, `ListImportedModels`, `ListMarketplaceModelEndpoints` and `ListPromptRouters` ([InvokeModel with inference targets](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-target-inference-invokemodel.html)). If the role cannot do a list action, the target does not get to the `Ready` state.
+
+1. Go to the example directory.
+
+   ```sh
+   cd examples/inference-gateway
+   ```
+
+2. Initialize Terraform.
+
+   ```sh
+   terraform init
+   ```
+
+3. Apply the template.
+
+   ```sh
+   terraform apply \
+     -var 'langguard_url=https://langguard.example.com' \
+     -var 'langguard_api_key_secret_arn=arn:aws:secretsmanager:us-east-1:111122223333:secret:langguard-api-key-AbCdEf'
+   ```
+
+4. Copy the `claude_code_env` output into the `env` block of the Claude Code managed settings. It sets `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`, and `ANTHROPIC_BEDROCK_BASE_URL` to the `/inference` path of the gateway. The developers then need `bedrock-agentcore:InvokeGateway` on the gateway, and no Amazon Bedrock permissions.
+
+### Routes
+
+The function reads the method and the path of each REQUEST event. First it makes the path normal: it removes the query, empty segments (`//` and a trailing `/`), `.` segments and `..` segments, and decodes each segment (`%6Dodel` becomes `model`). It compares each segment other than the model ID without case. A path with a bad percent escape is blocked with the "not valid" text. Then it removes `inference` from the start of the path, if the path has it. The first row that agrees with the call decides. The rows that are marked "under `/inference` only" agree only with a path that had `/inference`, or with each path when `LANGGUARD_GATEWAY_KIND` is `inference`. Thus a model call gets the same check with or without `/inference` in the event path.
+
+| Method and path | Action |
+| --- | --- |
+| `POST /model/{model}/invoke` | LangGuard check. Dialect `bedrock_invoke`, `stream` is `false`. |
+| `POST /model/{model}/invoke-with-response-stream` | LangGuard check. Dialect `bedrock_invoke`, `stream` is `true`. |
+| `POST /model/{model}/count-tokens` | Pass. No model runs. |
+| `POST /v1/messages` | LangGuard check. Dialect `anthropic_messages`. `model` and `stream` come from the body. |
+| `POST /v1/chat/completions` | LangGuard check. Dialect `openai_chat`. `model` and `stream` come from the body. |
+| `GET` on each path, for example `/inference-profiles` and `/v1/models` (under `/inference` only) | Pass. No model runs. |
+| Each other call, for example `POST /v1/responses` (under `/inference` only) | Blocked with the "not supported" text. LangGuard cannot check it. |
+| A path without `/inference` that no row agrees with, for example `POST /v1/orders` of an HTTP target | Pass. |
+
+`{model}` is one or more segments, because the ARN of an application inference profile has a `/`. The function decodes the model ID (`%3A` becomes `:`, `%2F` becomes `/`) and keeps its case. A RESPONSE event always passes.
+
+The function sends `interceptor/invoke_model` to the same LangGuard endpoint and with the same API key as a tool call. The params have `payload` (`dialect`, `model`, `stream`, the request `body`, and `truncated`), `config.langguard`, and `context`, with the same sources as a tool call (see "What LangGuard receives"). For a SigV4-signed call, the STS key map gives the user, as for a `tools/call`.
+
+### Inference gateway mode
+
+The function can serve an MCP gateway, a gateway with HTTP targets and an inference gateway at the same time. Then a path without `/inference` that no row agrees with passes, because it can be a path of an HTTP target. If the inference gateway gives the event path without `/inference`, a call to an inference API that LangGuard cannot check then passes.
+
+Set `LANGGUARD_GATEWAY_KIND` to `inference` on a function that serves only inference gateways. The function then reads each path as a path under `/inference`. Each `http` REQUEST event that no LangGuard check row and no pass row agrees with is blocked with the "not supported" text, with or without `/inference`. Do not set it on a function that also serves HTTP targets: it blocks their calls. The `examples/inference-gateway` template and the test rig make a function of their own for the inference gateway and set `gateway_kind = "inference"` in the `terraform` module.
+
+### Blocks
+
+A block is a response from the gateway with HTTP status 403, in the error format of the client. The gateway then does not call Amazon Bedrock.
+
+| Dialect | Headers | Body |
+| --- | --- | --- |
+| `bedrock_invoke` | `x-amzn-ErrorType: AccessDeniedException` | `{"message": "<text>"}` |
+| `anthropic_messages` | None | `{"type": "error", "error": {"type": "permission_error", "message": "<text>"}}` |
+| `openai_chat` | None | `{"error": {"message": "<text>", "type": "permission_denied"}}` |
+
+A blocked call to a path that is not supported uses the Amazon Bedrock format under `/model/`, the Anthropic format under `/v1/messages/`, and the OpenAI format for other paths.
+
+| Cause | Text |
+| --- | --- |
+| Policy | `Blocked by LangGuard: <policy message>` |
+| Unavailable | `Blocked by LangGuard: the policy check is unavailable, so this model call is not allowed.` |
+| Not valid | `Blocked by LangGuard: this is not a valid model request, so it was not sent for a policy check.` |
+| Not supported | `Blocked by LangGuard: LangGuard cannot check calls to this inference API, so this call is not allowed.` |
+| Too large | `Blocked by LangGuard: the model request is too large for the policy check, so it is not allowed.` |
+
+The rules for each LangGuard result are the same as for a tool call (see "Behavior"). Thus in Shadow mode LangGuard does not block a model call for a policy result, an escalation, or an unreachable policy engine. When LangGuard cannot be reached, the model call is blocked. A `bedrock_invoke` body without a string `anthropic_version` is not an Anthropic model call, so the function blocks it with the "not supported" text and does not call LangGuard. A JSON-RPC error `-32602` from LangGuard blocks the call with the "not valid" text. A body that is not a JSON object, a body with a top-level key two times (LangGuard and Amazon Bedrock can read different values), or a call that names no model, is blocked with the "not valid" text, and the function does not call LangGuard.
+
+### Size and binary content
+
+The function sends each message of the request to LangGuard. It does not remove messages. It replaces the data of each binary content block with a short text, because the LangGuard policy check does not read binary content: the `source.data` of an Anthropic `image` or `document` block (also in a `tool_result`), and the `url` of an OpenAI `image_url` that is a `data:` URL. It does not change text. It sets `truncated` to `true` only when it replaced data. If the request is larger than the LangGuard limit for a model call, LangGuard answers HTTP 413, and the call is blocked with the "too large" text.
+
+### Log line
+
+For a model call, the log line also has `route` (the row name: `invoke`, `invoke_stream`, `count_tokens`, `messages`, `chat_completions`, `read`, `unsupported`, `other` for a path that no row agrees with, `unknown` for a path that the function cannot read, or `response`), `dialect`, `model` (without control characters, cut to 256 characters), and `truncated` when the function replaced binary content. It does not log the body, the prompt, headers, or the API key.
+
+### Not verified on a real gateway
+
+- The function has not run on a real inference gateway. The automated tests use synthetic events in the documented `http` payload form.
+- That the REQUEST event has the path with `/inference`, for example `/inference/model/<model>/invoke`. The AWS documentation shows the client paths with `/inference` and the event path of an HTTP target as the client path. The function checks a model call with or without `/inference` in the event path. If the event path does not have `/inference` and `LANGGUARD_GATEWAY_KIND` is not set, each call that is not a LangGuard check row passes, for example `POST /v1/responses`.
+- How the gateway routes a path that is not normal, for example `//inference`, `/Model/` or `%6Dodel`, and if the event path is the path before or after the gateway made it normal. The function makes each path normal before it uses the route table, so these spellings get the LangGuard check. The tests do not show that the gateway and Amazon Bedrock read the path in the same way.
+- That an application inference profile ARN in the path reaches the event with a literal `/` or with `%2F`. The function accepts both.
+- That Amazon Bedrock rejects a body with a top-level key two times, or which value it uses. The function blocks such a body.
+- What the gateway does with a model call that is larger than the event size limit of Lambda. The function does not measure the body. LangGuard answers HTTP 413 for a body larger than its limit, and the function then blocks the call.
+- That the client gets the `x-amzn-ErrorType` header of a block. The AWS SDK uses that header to make an `AccessDeniedException`.
+- That the gateway gives the `Authorization` header of a SigV4 call to the interceptor. This is also not verified for tool calls (see "Find the user of an AWS_IAM call").
 
 ## Run the tests
 

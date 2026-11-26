@@ -102,6 +102,7 @@ resource "aws_lambda_function" "interceptor" {
         LANGGUARD_AUTHORIZER         = var.gateway_authorizer_type
       },
       var.user_claim != "" ? { LANGGUARD_USER_CLAIM = var.user_claim } : {},
+      var.gateway_kind != "" ? { LANGGUARD_GATEWAY_KIND = var.gateway_kind } : {},
       var.sts_key_map_enabled ? { LANGGUARD_KEY_MAP_TABLE = aws_dynamodb_table.key_map[0].name } : {},
     )
   }

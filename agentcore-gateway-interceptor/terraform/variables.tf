@@ -65,6 +65,17 @@ variable "gateway_authorizer_type" {
   }
 }
 
+variable "gateway_kind" {
+  description = "Set to inference when the function serves only gateways with an inference target. The function then blocks each http REQUEST that is not a known model call, read or token count, also without the /inference prefix. Empty means the function can also serve HTTP targets."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "inference"], var.gateway_kind)
+    error_message = "gateway_kind must be empty or inference."
+  }
+}
+
 variable "user_claim" {
   description = "Name of the JWT claim that LangGuard uses as the user ID. Empty means no user ID from a claim."
   type        = string

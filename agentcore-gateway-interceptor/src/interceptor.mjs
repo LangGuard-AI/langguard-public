@@ -1,8 +1,18 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 
+import {
+  HTTP_PASS,
+  INVOKE_MODEL_METHOD,
+  MODEL_BLOCK_TEXT,
+  classifyHttp,
+  httpBlock,
+  invokeModelParams,
+} from './inference.mjs';
+
 export const INTERCEPTOR_NAME = 'policy-langguard.ai';
 export const BLOCK_MARKER_KEY = 'langguard.ai/blocked';
 const DEFAULT_TIMEOUT_MS = 5000;
+const JSON_RPC_INVALID_PARAMS = -32602;
 const KEY_READ_TIMEOUT_MS = 3000;
 const IDENTITY_CLAIMS = ['user_id', 'ai_app_id', 'department', 'environment'];
 const TRACEPARENT = /^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$/;
@@ -16,7 +26,7 @@ const BLOCK_TEXT = {
   too_large:
     'Blocked by LangGuard: the tool call or its result is larger than 1 MB, the size limit of the policy check, so it is not allowed.',
 };
-const DEFAULT_BLOCK_REASON = 'The tool call does not comply with a LangGuard policy.';
+const DEFAULT_BLOCK_REASON = 'The call does not comply with a LangGuard policy.';
 
 /**
  * @typedef {'request' | 'response'} Phase
@@ -30,7 +40,7 @@ const DEFAULT_BLOCK_REASON = 'The tool call does not comply with a LangGuard pol
  * @typedef {(
  *   | { kind: 'allow' }
  *   | { kind: 'block', message: string }
- *   | { kind: 'unavailable', reason: string, cause: 'unavailable' | 'too_large' }
+ *   | { kind: 'unavailable', reason: string, cause: 'unavailable' | 'too_large' | 'invalid' }
  * )} Decision
  * @typedef {{ kind: 'policy', message: string } | { kind: keyof typeof BLOCK_TEXT }} BlockCause
  * @typedef {{ kind: 'pass' } | { kind: 'block', text: string, marker?: string }} Outcome
@@ -254,11 +264,10 @@ function principalOf(claims) {
 }
 
 /**
- * Builds the `interceptor/invoke` params for one tool call.
  * `callerUser` is the user that the STS key map gives for a SigV4 call. A JWT claim user wins over it.
- * @param {{ phase: Phase, call: ToolCall, headers?: Record<string, unknown>, env?: Record<string, string | undefined>, callerUser?: string }} input
+ * @param {{ headers?: Record<string, unknown>, env?: Record<string, string | undefined>, callerUser?: string }} input
  */
-export function buildInvokeParams({ phase, call, headers, env = {}, callerUser }) {
+function callerContext({ headers, env = {}, callerUser }) {
   const trace = traceContext(headers, env);
   const sessionId = header(headers, 'mcp-session-id');
   // Only a CUSTOM_JWT authorizer verifies a bearer token. With AWS_IAM or no authorizer, a token is unverified.
@@ -267,13 +276,23 @@ export function buildInvokeParams({ phase, call, headers, env = {}, callerUser }
   const principal = principalOf(claims);
   const userClaim = env.LANGGUARD_USER_CLAIM;
   const userId = (userClaim && claims ? asString(claims[userClaim]) : undefined) ?? callerUser;
-
-  const args = phase === 'response' ? { ...call.arguments, result: call.result } : call.arguments;
   const context = {
     ...(trace ?? {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(principal !== undefined ? { principal } : {}),
   };
+  return {
+    config: { langguard: { agent_type: 'agentcore', ...(userId !== undefined ? { user_id: userId } : {}) } },
+    ...(Object.keys(context).length > 0 ? { context } : {}),
+  };
+}
+
+/**
+ * @param {{ phase: Phase, call: ToolCall, headers?: Record<string, unknown>, env?: Record<string, string | undefined>, callerUser?: string }} input
+ */
+export function buildInvokeParams({ phase, call, headers, env = {}, callerUser }) {
+  const args = phase === 'response' ? { ...call.arguments, result: call.result } : call.arguments;
+  const { config, context } = callerContext({ headers, env, callerUser });
   return {
     name: INTERCEPTOR_NAME,
     event: 'tools/call',
@@ -282,8 +301,8 @@ export function buildInvokeParams({ phase, call, headers, env = {}, callerUser }
       method: 'tools/call',
       params: { name: call.name, ...(args !== undefined ? { arguments: args } : {}) },
     },
-    config: { langguard: { agent_type: 'agentcore', ...(userId !== undefined ? { user_id: userId } : {}) } },
-    ...(Object.keys(context).length > 0 ? { context } : {}),
+    config,
+    ...(context !== undefined ? { context } : {}),
   };
 }
 
@@ -298,11 +317,19 @@ function timeoutMs(env) {
   return Number.isInteger(n) && n >= 1 && n <= MAX_TIMEOUT_MS ? n : undefined;
 }
 
+/** @returns {{ ok: true, inference: boolean } | { ok: false, reason: string }} */
+function gatewayKind(env) {
+  const value = env.LANGGUARD_GATEWAY_KIND;
+  if (value === undefined || value === '') return { ok: true, inference: false };
+  if (value === 'inference') return { ok: true, inference: true };
+  return { ok: false, reason: 'LANGGUARD_GATEWAY_KIND is not inference' };
+}
+
 /** @returns {Decision} */
 const unavailable = (reason, cause = 'unavailable') => ({ kind: 'unavailable', reason, cause });
 
 /** @returns {Promise<Decision>} */
-async function decide(deps, params, key) {
+async function decide(deps, method, params, key) {
   const baseUrl = deps.env.LANGGUARD_URL;
   if (!baseUrl) return unavailable('LANGGUARD_URL is not set');
   if (!URL.canParse(baseUrl) || new URL(baseUrl).protocol !== 'https:') {
@@ -317,7 +344,7 @@ async function decide(deps, params, key) {
     response = await deps.fetch(`${baseUrl.replace(/\/$/, '')}/api/interceptor`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${key.key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method: 'interceptor/invoke', params }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method, params }),
       signal: AbortSignal.timeout(timeout),
       // A followed redirect would take the decision from another location.
       redirect: 'error',
@@ -345,7 +372,8 @@ async function decide(deps, params, key) {
  */
 export function interpretInvokeResponse(body) {
   if (isObject(body) && body.error !== undefined) {
-    return unavailable(`JSON-RPC error ${String(isObject(body.error) ? body.error.code : body.error)}`);
+    const code = isObject(body.error) ? body.error.code : body.error;
+    return unavailable(`JSON-RPC error ${String(code)}`, code === JSON_RPC_INVALID_PARAMS ? 'invalid' : 'unavailable');
   }
   const result = isObject(body) && isObject(body.result) ? body.result : undefined;
   const validation = result && isObject(result.validation) ? result.validation : undefined;
@@ -462,22 +490,66 @@ const FALLBACK_OUTPUT = {
   },
 };
 
+/**
+ * @param {Deps} deps
+ * @param {ReturnType<typeof gatewayKind>} kind
+ * @param {Record<string, unknown>} entry
+ * @param {() => Promise<{ ok: true, key: string } | { ok: false, reason: string }>} key
+ */
+async function decideHttp(deps, kind, http, entry, key) {
+  const classification = classifyHttp(http, !kind.ok || kind.inference);
+  Object.assign(entry, classification.log);
+  if (!kind.ok && classification.log.phase === 'request') {
+    Object.assign(entry, { outcome: 'unavailable', reason: kind.reason });
+    return httpBlock(classification.log.dialect ?? classification.format ?? 'bedrock_invoke', MODEL_BLOCK_TEXT.unavailable);
+  }
+  if (classification.kind === 'pass') {
+    Object.assign(entry, { outcome: 'passthrough', reason: classification.reason });
+    return HTTP_PASS;
+  }
+  if (classification.kind === 'block') {
+    Object.assign(entry, { outcome: 'unsupported', reason: classification.reason });
+    return httpBlock(classification.format, MODEL_BLOCK_TEXT[classification.cause]);
+  }
+
+  const { request } = classification;
+  const { headers } = http.gatewayRequest;
+  key();
+  const caller = await callerOf(deps, headers);
+  entry.caller = caller.outcome;
+  const callerUser = caller.outcome === 'hit' ? caller.userName : undefined;
+  const params = invokeModelParams(request, callerContext({ headers, env: deps.env, callerUser }));
+  if (params.payload.truncated) entry.truncated = true;
+  entry.traceId = params.context?.traceId;
+  const decision = await decide(deps, INVOKE_MODEL_METHOD, params, await key());
+  entry.outcome = decision.kind;
+  if (decision.kind === 'allow') return HTTP_PASS;
+  if (decision.kind === 'block') {
+    entry.reason = 'policy';
+    return httpBlock(request.dialect, `Blocked by LangGuard: ${decision.message}`);
+  }
+  entry.reason = decision.reason;
+  return httpBlock(request.dialect, MODEL_BLOCK_TEXT[decision.cause]);
+}
+
 /** @param {Deps} deps */
 export function createHandler(deps) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((line) => console.log(line));
+  const kind = gatewayKind(deps.env);
 
   return async function handler(event) {
     const started = now();
     const entry = { phase: undefined, tool: undefined, outcome: 'unavailable', reason: undefined, traceId: undefined };
+    let http = false;
     try {
       const classification = classify(event);
+      const key = once(() => loadKey(deps.getApiKey, deps.keyReadTimeoutMs ?? KEY_READ_TIMEOUT_MS));
       if (classification.kind === 'http') {
-        Object.assign(entry, { outcome: 'passthrough', reason: 'http target' });
-        return { interceptorOutputVersion: '1.0', http: {} };
+        http = true;
+        return await decideHttp(deps, kind, event.http, entry, key);
       }
       entry.phase = classification.phase;
-      const key = once(() => loadKey(deps.getApiKey, deps.keyReadTimeoutMs ?? KEY_READ_TIMEOUT_MS));
       /** @param {BlockCause} cause */
       const blockWith = async (cause) => {
         const text = blockText(cause);
@@ -512,7 +584,7 @@ export function createHandler(deps) {
       const callerUser = caller.outcome === 'hit' ? caller.userName : undefined;
       const params = buildInvokeParams({ phase, call, headers, env: deps.env, callerUser });
       entry.traceId = params.context?.traceId;
-      const decision = await decide(deps, params, await key());
+      const decision = await decide(deps, 'interceptor/invoke', params, await key());
       entry.outcome = decision.kind;
       if (decision.kind === 'allow') return render(event, phase, { kind: 'pass' });
       if (decision.kind === 'block') {
@@ -523,7 +595,7 @@ export function createHandler(deps) {
       return await blockWith({ kind: decision.cause });
     } catch {
       Object.assign(entry, { outcome: 'unavailable', reason: 'internal error' });
-      return FALLBACK_OUTPUT;
+      return http ? httpBlock(entry.dialect ?? 'bedrock_invoke', MODEL_BLOCK_TEXT.unavailable) : FALLBACK_OUTPUT;
     } finally {
       try {
         log(JSON.stringify({ ...entry, durationMs: now() - started }));
