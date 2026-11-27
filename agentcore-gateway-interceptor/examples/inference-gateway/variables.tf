@@ -72,3 +72,27 @@ variable "invoke_model_resource_arns" {
   type        = list(string)
   default     = []
 }
+
+variable "secret_kms_key_arn" {
+  description = "ARN of the customer-managed KMS key that encrypts the API key secret. Empty means the secret uses the AWS managed key."
+  type        = string
+  default     = ""
+}
+
+variable "role_permissions_boundary_arn" {
+  description = "ARN of the permissions boundary for the function role. Empty means no boundary."
+  type        = string
+  default     = ""
+}
+
+variable "subnet_ids" {
+  description = "Subnets for the function. Set them when LangGuard has a private endpoint. The subnets need a path to LangGuard and to Secrets Manager. Empty means no VPC."
+  type        = list(string)
+  default     = []
+}
+
+variable "security_group_ids" {
+  description = "Security groups for the function. Use them together with subnet_ids."
+  type        = list(string)
+  default     = []
+}

@@ -61,6 +61,8 @@ function blockResponse(output) {
 }
 
 const BLOCK_STATUS = { bedrock_invoke: 451, anthropic_messages: 403, openai_chat: 403 };
+const INFERENCE_ENV = { ...ENV, LANGGUARD_GATEWAY_KIND: 'inference' };
+const NOT_VALID_TEXT = 'Blocked by LangGuard: this is not a valid model request, so it was not sent for a policy check.';
 const formatOf = (body) => ('message' in body ? 'bedrock_invoke' : body.type === 'error' ? 'anthropic_messages' : 'openai_chat');
 
 describe('inference route table', () => {
@@ -193,7 +195,6 @@ describe('inference route table', () => {
 });
 
 describe('LANGGUARD_GATEWAY_KIND=inference', () => {
-  const INFERENCE_ENV = { ...ENV, LANGGUARD_GATEWAY_KIND: 'inference' };
   const UNSUPPORTED = 'Blocked by LangGuard: LangGuard cannot check calls to this inference API, so this call is not allowed.';
 
   for (const [path, body] of [
@@ -300,6 +301,70 @@ describe('path normalization', () => {
     });
     assert.equal(logged().outcome, 'unsupported');
   });
+
+  for (const env of [ENV, INFERENCE_ENV]) {
+    const mode = env === ENV ? 'default mode' : 'inference mode';
+    for (const [method, path] of [
+      ['POST', '/inference/../v1/responses'],
+      ['POST', '/inference/%2E%2E/v1/responses'],
+      ['POST', '/inference%2Fmodel%2Fx%2Finvoke'],
+      ['POST', '/inference%2Fv1%2Fresponses'],
+      ['POST', '/inference;a=b/v1/responses'],
+      ['POST', '/inference\\v1\\responses'],
+      ['POST', '/inference%00/v1/responses'],
+      ['POST', '/inference%20/v1/responses'],
+      ['POST', '/inference/model/x/count-tokens?/../invoke'],
+      ['POST', '/inference/model/x/count-tokens#/../invoke'],
+      ['POST', '/inference/model/x/count-tokens/invoke/..'],
+      ['POST', '/inference/model/x/invoke/%2E%2E/count-tokens'],
+      ['POST', '/inference/model/x/count-to%E2%84%AAens'],
+      ['POST', '/api//orders'],
+      ['GET', '/inference/../v1/models'],
+    ]) {
+      it(`${method} ${path} is blocked with no LangGuard call in ${mode}`, async () => {
+        const { handler, calls, logged } = setup({ env });
+        const response = blockResponse(await handler(httpEvent({ method, path, body: BEDROCK_BODY })));
+        assert.equal(calls.length, 0);
+        assert.equal(response.statusCode, BLOCK_STATUS[formatOf(response.body)]);
+        if (env === ENV || logged().route === 'count_tokens' || method === 'GET') {
+          assert.deepEqual(response.body, { message: NOT_VALID_TEXT });
+          assert.equal(logged().reason, 'path is not in normal form');
+        }
+      });
+    }
+  }
+
+  for (const [method, path] of [
+    ['GET', '/inference/inference-profiles?type=SYSTEM_DEFINED'],
+    ['POST', `/inference/model/${encodedModel}/count-tokens/`],
+    ['POST', `/model/${encodeURIComponent('arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/a1')}/count-tokens`],
+  ]) {
+    it(`${method} ${path} still passes in inference mode`, async () => {
+      const { handler, calls } = setup({ env: INFERENCE_ENV });
+      assert.deepEqual(await handler(httpEvent({ method, path, body: BEDROCK_BODY })), PASS);
+      assert.equal(calls.length, 0);
+    });
+  }
+
+  it('a path in normal form of an HTTP target still passes in default mode', async () => {
+    const { handler, calls } = setup();
+    assert.deepEqual(await handler(httpEvent({ path: '/api/orders/', body: CHAT_BODY })), PASS);
+    assert.equal(calls.length, 0);
+  });
+});
+
+describe('a REQUEST event with a gatewayResponse that is not a response', () => {
+  for (const value of [{}, '', 0, false, [], { statusCode: '200' }]) {
+    it(`is blocked with no LangGuard call when gatewayResponse is ${JSON.stringify(value)}`, async () => {
+      const { handler, calls, logged } = setup({ env: INFERENCE_ENV });
+      const event = httpEvent({ path: `/inference/model/${encodedModel}/invoke`, body: BEDROCK_BODY });
+      event.http.gatewayResponse = value;
+      const response = blockResponse(await handler(event));
+      assert.equal(calls.length, 0);
+      assert.deepEqual(response.body, { message: NOT_VALID_TEXT });
+      assert.equal(logged().reason, 'gatewayResponse is not a response');
+    });
+  }
 });
 
 describe('block format of each dialect', () => {
@@ -392,12 +457,27 @@ describe('duplicate keys in the body', () => {
       assert.equal(formatOf(response.body), format);
       assert.equal(response.statusCode, BLOCK_STATUS[format]);
       assert.equal(response.body.message ?? response.body.error.message, NOT_VALID);
-      assert.equal(logged().reason, 'body has a duplicate top-level key');
+      assert.equal(logged().reason, 'body has a duplicate key');
     });
   }
 
   for (const [name, text] of [
     ['a repeated key in a nested object', `{"anthropic_version":"bedrock-2023-05-31","metadata":{"a":1,"a":2},"messages":${HIDDEN}}`],
+    ['a repeated content key in a message', `{"anthropic_version":"bedrock-2023-05-31","messages":[{"role":"user","content":"Hidden","content":"Hello"}]}`],
+    ['a repeated text key in a content block', `{"anthropic_version":"bedrock-2023-05-31","messages":[{"role":"user","content":[{"type":"text","text":"Hidden","text":"Hello"}]}]}`],
+  ]) {
+    it(`${name} is blocked with the "not valid" text and no LangGuard call`, async () => {
+      const { handler, calls, logged } = setup();
+      const response = blockResponse(await handler(httpEvent({ path: invoke, body: b64(text) })));
+      assert.equal(calls.length, 0);
+      assert.equal(response.statusCode, BLOCK_STATUS.bedrock_invoke);
+      assert.deepEqual(response.body, { message: NOT_VALID });
+      assert.equal(logged().reason, 'body has a duplicate key');
+    });
+  }
+
+  for (const [name, text] of [
+    ['the same key in two objects', `{"anthropic_version":"bedrock-2023-05-31","messages":[{"role":"user","content":"a"},{"role":"user","content":"b"}]}`],
     ['key text in a string value', `{"anthropic_version":"bedrock-2023-05-31","system":"x\\",\\"messages\\":[]}{","messages":${HIDDEN}}`],
   ]) {
     it(`${name} goes to LangGuard`, async () => {
