@@ -320,6 +320,14 @@ describe('path normalization', () => {
       ['POST', '/inference/model/x/count-to%E2%84%AAens'],
       ['POST', '/api//orders'],
       ['GET', '/inference/../v1/models'],
+      ['POST', `/inference/model/${encodedModel}/invoke%3F/count-tokens`],
+      ['POST', `/inference/model/${encodedModel}/invoke%23/count-tokens`],
+      ['POST', `/model/${encodedModel}/invoke%3F/count-tokens`],
+      ['POST', `/arn%3Ax%2F..%2Finference%2Fmodel%2F${encodedModel}%2Finvoke`],
+      ['POST', '/arn:x%2F..%2Finference%2Fv1%2Fresponses'],
+      ['POST', '/inference/model/arn:aws:bedrock:us-east-1:1:x%2F..%2Fy/count-tokens'],
+      ['POST', 'inference%2Fmodel%2Fm%2Finvoke'],
+      ['POST', '/inference%252Fv1%252Fresponses'],
     ]) {
       it(`${method} ${path} is blocked with no LangGuard call in ${mode}`, async () => {
         const { handler, calls, logged } = setup({ env });
@@ -349,6 +357,16 @@ describe('path normalization', () => {
   it('a path in normal form of an HTTP target still passes in default mode', async () => {
     const { handler, calls } = setup();
     assert.deepEqual(await handler(httpEvent({ path: '/api/orders/', body: CHAT_BODY })), PASS);
+    assert.equal(calls.length, 0);
+  });
+});
+
+describe('a RESPONSE event of a streamed answer', () => {
+  it('passes with no LangGuard call when gatewayResponse has isStreamingResponse and no statusCode', async () => {
+    const { handler, calls } = setup();
+    const event = httpEvent({ path: '/api/orders', body: CHAT_BODY });
+    event.http.gatewayResponse = { isStreamingResponse: true, body: b64({ ok: true }) };
+    assert.deepEqual(await handler(event), PASS);
     assert.equal(calls.length, 0);
   });
 });

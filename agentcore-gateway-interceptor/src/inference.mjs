@@ -81,21 +81,27 @@ function normalizePath(path) {
   return { raw, names };
 }
 
-const UNSAFE_IN_SEGMENT = /[^\x21-\x7e]|[\\;]/;
+const UNSAFE_IN_SEGMENT = /[^\x21-\x7e]|[\\;?#%]/;
+const isDotOrEmpty = (name) => name === '' || name === '.' || name === '..';
 
 /**
  * A pass row must not depend on how the gateway and Amazon Bedrock read a path, so it applies only to a path in
- * normal form: no `?` or `#` (a GET can have a query), no empty, `.` or `..` segment (a trailing `/` is allowed), and printable ASCII with no
- * `\\` or `;`. A decoded `/` is allowed only in an ARN, the model segment of an application inference profile.
+ * normal form: a leading `/`, no `?` or `#` (a GET can have a query), no empty, `.` or `..` segment (a trailing `/`
+ * is allowed), and printable ASCII with no `\`, `;`, `?`, `#` or `%` in each decoded segment. A decoded `/` is allowed only
+ * when `arnSegments` is true, in a segment that starts with `arn:` and whose parts are not empty, `.` or `..`: the
+ * model ID of an application inference profile.
+ * @param {string} path
+ * @param {boolean} arnSegments
  */
-function isNormalPath(path) {
-  if (/[?#]/.test(path)) return false;
+function isNormalPath(path, arnSegments) {
+  if (!path.startsWith('/') || /[?#]/.test(path)) return false;
   const raw = path.split('/').slice(1);
   if (raw.at(-1) === '') raw.pop();
   return raw.every((segment) => {
     const name = decodeURIComponent(segment);
-    if (name === '' || name === '.' || name === '..' || UNSAFE_IN_SEGMENT.test(name)) return false;
-    return !name.includes('/') || name.startsWith('arn:');
+    if (isDotOrEmpty(name) || UNSAFE_IN_SEGMENT.test(name)) return false;
+    if (!name.includes('/')) return true;
+    return arnSegments && name.startsWith('arn:') && !name.split('/').some(isDotOrEmpty);
   });
 }
 
@@ -171,7 +177,8 @@ function decodeBody(body) {
  */
 export function classifyHttp(http, inferenceGateway) {
   if (http.gatewayResponse != null) {
-    if (isObject(http.gatewayResponse) && typeof http.gatewayResponse.statusCode === 'number') {
+    const response = http.gatewayResponse;
+    if (isObject(response) && (typeof response.statusCode === 'number' || typeof response.isStreamingResponse === 'boolean')) {
       return { kind: 'pass', log: { phase: 'response', route: 'response' }, reason: 'response event' };
     }
     return {
@@ -211,7 +218,8 @@ export function classifyHttp(http, inferenceGateway) {
     (r) => (inferencePath || !r.inferenceOnly) && (r.method === '*' || r.method === method) && (match = matchPath(r.path, subPath)),
   );
   const passes = !row || row.action.kind === 'pass';
-  if (passes && !isNormalPath(method === 'GET' ? request.path.split(/[?#]/)[0] : request.path)) {
+  const checkedPath = method === 'GET' ? request.path.split(/[?#]/)[0] : request.path;
+  if (passes && !isNormalPath(checkedPath, row?.route === 'count_tokens')) {
     return {
       kind: 'block',
       log: { phase: 'request', route: row?.route ?? 'other' },
