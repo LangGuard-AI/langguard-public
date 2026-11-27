@@ -26,13 +26,17 @@ locals {
 module "interceptor" {
   source = "../../terraform"
 
-  function_name                = "${var.name}-interceptor"
-  langguard_url                = var.langguard_url
-  langguard_api_key_secret_arn = var.langguard_api_key_secret_arn
-  gateway_authorizer_type      = var.authorizer_type
-  gateway_kind                 = "inference"
-  user_claim                   = var.user_claim
-  sts_key_map_enabled          = var.sts_key_map_enabled
+  function_name                 = "${var.name}-interceptor"
+  langguard_url                 = var.langguard_url
+  langguard_api_key_secret_arn  = var.langguard_api_key_secret_arn
+  gateway_authorizer_type       = var.authorizer_type
+  gateway_kind                  = "inference"
+  user_claim                    = var.user_claim
+  sts_key_map_enabled           = var.sts_key_map_enabled
+  secret_kms_key_arn            = var.secret_kms_key_arn
+  role_permissions_boundary_arn = var.role_permissions_boundary_arn
+  subnet_ids                    = var.subnet_ids
+  security_group_ids            = var.security_group_ids
 }
 
 data "aws_iam_policy_document" "gateway_assume" {
@@ -100,7 +104,7 @@ data "aws_iam_policy_document" "gateway" {
 }
 
 resource "aws_iam_role_policy" "gateway" {
-  name   = "langguard-inference-gateway"
+  name   = "${var.name}-gateway"
   role   = local.role_name
   policy = data.aws_iam_policy_document.gateway.json
 }

@@ -81,6 +81,30 @@ function normalizePath(path) {
   return { raw, names };
 }
 
+const UNSAFE_IN_SEGMENT = /[^\x21-\x7e]|[\\;?#%]/;
+const isDotOrEmpty = (name) => name === '' || name === '.' || name === '..';
+
+/**
+ * A pass row must not depend on how the gateway and Amazon Bedrock read a path, so it applies only to a path in
+ * normal form: a leading `/`, no `?` or `#` (a GET can have a query), no empty, `.` or `..` segment (a trailing `/`
+ * is allowed), and printable ASCII with no `\`, `;`, `?`, `#` or `%` in each decoded segment. A decoded `/` is allowed only
+ * when `arnSegments` is true, in a segment that starts with `arn:` and whose parts are not empty, `.` or `..`: the
+ * model ID of an application inference profile.
+ * @param {string} path
+ * @param {boolean} arnSegments
+ */
+function isNormalPath(path, arnSegments) {
+  if (!path.startsWith('/') || /[?#]/.test(path)) return false;
+  const raw = path.split('/').slice(1);
+  if (raw.at(-1) === '') raw.pop();
+  return raw.every((segment) => {
+    const name = decodeURIComponent(segment);
+    if (isDotOrEmpty(name) || UNSAFE_IN_SEGMENT.test(name)) return false;
+    if (!name.includes('/')) return true;
+    return arnSegments && name.startsWith('arn:') && !name.split('/').some(isDotOrEmpty);
+  });
+}
+
 /** @returns {{ model?: string } | undefined} */
 function matchPath(pattern, { raw, names }) {
   const at = pattern.indexOf(MODEL);
@@ -99,29 +123,34 @@ function matchPath(pattern, { raw, names }) {
 }
 
 /** JSON.parse keeps the last value of a repeated key, and another reader can keep the first. */
-function hasDuplicateTopLevelKey(text) {
-  const keys = new Set();
-  let depth = 0;
+function hasDuplicateKey(text) {
+  /** @type {(Set<string> | null)[]} */
+  const stack = [];
   let atKey = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (c === '"') {
       let end = i + 1;
       while (text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
-      if (depth === 1 && atKey) {
+      const keys = stack.at(-1);
+      if (atKey && keys) {
         const key = JSON.parse(text.slice(i, end + 1));
         if (keys.has(key)) return true;
         keys.add(key);
         atKey = false;
       }
       i = end;
-    } else if (c === '{' || c === '[') {
-      depth++;
-      if (depth === 1) atKey = true;
-    } else if (c === '}' || c === ']') {
-      depth--;
-    } else if (c === ',' && depth === 1) {
+    } else if (c === '{') {
+      stack.push(new Set());
       atKey = true;
+    } else if (c === '[') {
+      stack.push(null);
+      atKey = false;
+    } else if (c === '}' || c === ']') {
+      stack.pop();
+      atKey = false;
+    } else if (c === ',') {
+      atKey = stack.at(-1) != null;
     }
   }
   return false;
@@ -138,7 +167,7 @@ function decodeBody(body) {
     return { reason: 'body is not a JSON object' };
   }
   if (!isObject(parsed)) return { reason: 'body is not a JSON object' };
-  return hasDuplicateTopLevelKey(text) ? { reason: 'body has a duplicate top-level key' } : { body: parsed };
+  return hasDuplicateKey(text) ? { reason: 'body has a duplicate key' } : { body: parsed };
 }
 
 /**
@@ -148,7 +177,17 @@ function decodeBody(body) {
  */
 export function classifyHttp(http, inferenceGateway) {
   if (http.gatewayResponse != null) {
-    return { kind: 'pass', log: { phase: 'response', route: 'response' }, reason: 'response event' };
+    const response = http.gatewayResponse;
+    if (isObject(response) && (typeof response.statusCode === 'number' || typeof response.isStreamingResponse === 'boolean')) {
+      return { kind: 'pass', log: { phase: 'response', route: 'response' }, reason: 'response event' };
+    }
+    return {
+      kind: 'block',
+      log: { phase: 'request', route: 'unknown' },
+      format: 'bedrock_invoke',
+      cause: 'invalid',
+      reason: 'gatewayResponse is not a response',
+    };
   }
   const request = isObject(http.gatewayRequest) ? http.gatewayRequest : {};
   if (typeof request.path !== 'string' || typeof request.httpMethod !== 'string') {
@@ -178,6 +217,17 @@ export function classifyHttp(http, inferenceGateway) {
   const row = ROUTES.find(
     (r) => (inferencePath || !r.inferenceOnly) && (r.method === '*' || r.method === method) && (match = matchPath(r.path, subPath)),
   );
+  const passes = !row || row.action.kind === 'pass';
+  const checkedPath = method === 'GET' ? request.path.split(/[?#]/)[0] : request.path;
+  if (passes && !isNormalPath(checkedPath, row?.route === 'count_tokens')) {
+    return {
+      kind: 'block',
+      log: { phase: 'request', route: row?.route ?? 'other' },
+      format: 'bedrock_invoke',
+      cause: 'invalid',
+      reason: 'path is not in normal form',
+    };
+  }
   if (!row) return { kind: 'pass', log: { phase: 'request', route: 'other' }, reason: 'http target' };
   const { route, action } = row;
   if (action.kind === 'pass') return { kind: 'pass', log: { phase: 'request', route }, reason: action.reason };
